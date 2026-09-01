@@ -92,6 +92,37 @@ def test_mps_get_device_falls_back_to_cpu_without_env_var():
             os.environ["TRANSFORMERLENS_ALLOW_MPS"] = original
 
 
+def test_mps_sparse_probe_moves_to_cpu_before_float64_conversion():
+    """Sparse probing transfers selected data to CPU before float64 fitting."""
+    from transformer_lens.tools.analysis.sparse_probing import (
+        fit_sparse_probe,
+        sweep_sparse_probe,
+    )
+
+    try:
+        generator = torch.Generator().manual_seed(7)
+        labels = torch.tensor([0, 1] * 20, dtype=torch.int64)
+        features = 0.05 * torch.randn(40, 4, generator=generator)
+        features[:, 0] += 3 * (2 * labels - 1)
+        features_mps = features.to("mps")
+
+        result = fit_sparse_probe(features_mps, labels.to("mps"), k=1, seed=0)
+        sweep = sweep_sparse_probe(
+            features_mps,
+            labels,
+            ks=[1],
+            seed=0,
+            n_random_subsets=1,
+            n_label_shuffles=1,
+        )
+
+        assert result.coefficients.device.type == "cpu"
+        assert result.coefficients.dtype == torch.float64
+        assert sweep.probes[0].selected_indices == [0]
+    finally:
+        _cleanup()
+
+
 def test_mps_warn_if_mps_emits_warning_without_env_var():
     """warn_if_mps() emits a UserWarning when MPS is used without the env var."""
     import transformer_lens.utilities.devices as devices_module

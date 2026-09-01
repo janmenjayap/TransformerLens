@@ -122,8 +122,9 @@ For $X \in \mathbb{R}^{n \times d}$ and binary labels $y$:
 Every $k$-sweep uses one fixed preprocessing mode and L2 strength. Curve
 shape is conditional on those choices; no hyperparameter search is performed.
 
-Solver details: score reductions run in at least float32 on the input device;
-only the selected $[n, k]$ matrices are transferred to CPU float64 for LBFGS.
+Solver details: score reductions run in at least float32 on the input device. The
+$d$-dimensional score vector moves to CPU for deterministic ranking, while only the selected
+$[n, k]$ matrices move to CPU before float64 conversion for LBFGS.
 The implementation never mutates global RNG state.
 
 ## API
@@ -144,8 +145,8 @@ fit_sparse_probe(
 ```
 
 Returns class labels/counts, selected indices/scores, coefficients/intercept,
-preprocessing metadata, split indices, held-out metrics, and solver metadata
-(objective, grad norm, iterations, convergence).
+preprocessing metadata, split indices, held-out metrics, requested optimization settings,
+and solver metadata (objective, grad norm, iterations, convergence).
 
 ### sweep_sparse_probe
 

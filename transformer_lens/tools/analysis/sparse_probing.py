@@ -20,13 +20,14 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from jaxtyping import Bool, Float, Int, Integer
 
 # ---------------------------------------------------------------------------
 # Result containers
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class SparseProbeMetrics:
     """Held-out classification metrics."""
 
@@ -40,7 +41,7 @@ class SparseProbeMetrics:
     fn: int
 
 
-@dataclass
+@dataclass(frozen=True)
 class SparseProbeResult:
     """Result of a single :func:`fit_sparse_probe` call."""
 
@@ -50,6 +51,8 @@ class SparseProbeResult:
     preprocess: str
     l2_strength: float
     seed: int
+    max_iter: int
+    grad_threshold: float
 
     # Class bookkeeping
     labels: List[int]
@@ -58,29 +61,28 @@ class SparseProbeResult:
     n_test: int
     n_train_per_class: Dict[int, int]
     n_test_per_class: Dict[int, int]
-    train_indices: torch.Tensor
-    test_indices: torch.Tensor
+    train_indices: Int[torch.Tensor, "train_example"]
+    test_indices: Int[torch.Tensor, "test_example"]
 
     # Selection
     selected_indices: List[int]
     selected_scores: List[float]  # raw signed mean-difference
 
     # Fit
-    coefficients: torch.Tensor  # shape [k] CPU float64
+    coefficients: Float[torch.Tensor, "selected_feature"]
     intercept: float
     objective: float
     grad_norm: float
     n_iter: int
     converged: bool
+    metrics: SparseProbeMetrics
 
     # Preprocessing metadata
-    preprocess_mean: Optional[torch.Tensor] = None  # shape [k] or None
-    preprocess_scale: Optional[torch.Tensor] = None  # shape [k] or None
+    preprocess_mean: Optional[Float[torch.Tensor, "selected_feature"]] = None
+    preprocess_scale: Optional[Float[torch.Tensor, "selected_feature"]] = None
 
-    # Metrics
-    metrics: SparseProbeMetrics = None  # type: ignore[assignment]
-    logits_test: Optional[torch.Tensor] = None  # shape [n_test] float64
-    preds_test: Optional[torch.Tensor] = None  # shape [n_test] bool/int
+    logits_test: Optional[Float[torch.Tensor, "test_example"]] = None
+    preds_test: Optional[Integer[torch.Tensor, "test_example"]] = None
 
     def summary(self) -> str:
         return (
@@ -89,7 +91,7 @@ class SparseProbeResult:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class SparseSweepResult:
     """Result of :func:`sweep_sparse_probe`."""
 
@@ -99,13 +101,15 @@ class SparseSweepResult:
     preprocess: str
     l2_strength: float
     seed: int
+    max_iter: int
+    grad_threshold: float
     probes: List[SparseProbeResult] = field(default_factory=list)
     # controls: one entry per k, each is list of metrics or full results
     random_controls: List[List[SparseProbeResult]] = field(default_factory=list)
     label_shuffle_controls: List[List[SparseProbeResult]] = field(default_factory=list)
     # shared split indices (same as in every probe)
-    train_indices: Optional[torch.Tensor] = None
-    test_indices: Optional[torch.Tensor] = None
+    train_indices: Optional[Int[torch.Tensor, "train_example"]] = None
+    test_indices: Optional[Int[torch.Tensor, "test_example"]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +149,7 @@ def _validate_X_y(
         pass
     else:
         raise TypeError(f"y must be Boolean or integer, got {y.dtype}")
-    return X, y
+    return X, y.detach().to(device="cpu")
 
 
 def _validate_k(k: int, d: int) -> None:
@@ -292,14 +296,14 @@ def _mean_difference_scores(
     else:
         Xc = X_train
     # also ensure float for mean
-    pos_mask = y_train_int == positive_label
+    pos_mask = (y_train_int == positive_label).to(device=Xc.device)
     neg_mask = ~pos_mask
     # If y has only two values, neg is the other label; pos_mask selects positive
     # Use float32+ for reduction
     pos_mean = Xc[pos_mask].mean(dim=0)
     neg_mean = Xc[neg_mask].mean(dim=0)
-    scores = pos_mean - neg_mean  # shape [d], preserves device
-    return scores
+    scores = pos_mean - neg_mean
+    return scores.to(device="cpu")
 
 
 def _select_top_k(scores: torch.Tensor, k: int) -> Tuple[List[int], List[float]]:
@@ -332,10 +336,8 @@ def _select_top_k(scores: torch.Tensor, k: int) -> Tuple[List[int], List[float]]
 def _fit_logistic_lbfgs(
     X_train_sel: torch.Tensor,
     y_train_bin: torch.Tensor,
-    X_test_sel: torch.Tensor,
     l2_strength: float,
     class_weights: Dict[int, float],
-    positive_label: int,
     y_train_int: torch.Tensor,
     grad_threshold: float,
     max_iter: int = 100,
@@ -347,8 +349,7 @@ def _fit_logistic_lbfgs(
     """
     device = torch.device("cpu")
     # Move to CPU float64
-    Xt = X_train_sel.to(device=device, dtype=torch.float64)
-    Xte = X_test_sel.to(device=device, dtype=torch.float64)
+    Xt = X_train_sel.to(device=device).to(dtype=torch.float64)
     # y_train_bin is 0/1 where 1==positive
     yt = y_train_bin.to(device=device, dtype=torch.float64)
     # weights per example
@@ -368,8 +369,8 @@ def _fit_logistic_lbfgs(
     optimizer = torch.optim.LBFGS(
         [w, b],
         max_iter=max_iter,
-        tolerance_grad=1e-7,
-        tolerance_change=1e-9,
+        tolerance_grad=grad_threshold,
+        tolerance_change=0.0,
         line_search_fn="strong_wolfe",
     )
 
@@ -386,7 +387,7 @@ def _fit_logistic_lbfgs(
 
     # LBFGS step
     try:
-        loss_val = optimizer.step(closure)
+        optimizer.step(closure)
     except Exception as e:
         raise RuntimeError(f"LBFGS failed: {e}") from e
 
@@ -412,14 +413,10 @@ def _fit_logistic_lbfgs(
     if not torch.isfinite(w).all() or not torch.isfinite(b).all():
         raise RuntimeError("non-finite parameters after LBFGS")
 
-    # Retrieve n_iter from optimizer state? LBFGS stores func_evals; use param group
-    n_iter = optimizer.state_dict()["param_groups"][0].get("n_iter", max_iter)  # type: ignore
-    # Not reliable across torch versions; estimate from state
-    try:
-        state_w = optimizer.state[w]
-        n_iter_val = int(state_w.get("func_evals", max_iter))  # type: ignore
-    except Exception:
-        n_iter_val = max_iter
+    state_n_iter = optimizer.state[w].get("n_iter", 0)
+    if not isinstance(state_n_iter, int):
+        raise RuntimeError("LBFGS returned a non-integer iteration count")
+    n_iter_val = state_n_iter
 
     converged = grad_norm <= grad_threshold
     if not converged:
@@ -489,15 +486,15 @@ def _validate_preprocess(p: str) -> None:
 
 
 def fit_sparse_probe(
-    X: torch.Tensor,
-    y: torch.Tensor,
+    X: Float[torch.Tensor, "example feature"],
+    y: Bool[torch.Tensor, "example"] | Integer[torch.Tensor, "example"],
     k: int,
     test_fraction: float = 0.3,
     positive_label: int = 1,
     preprocess: str = "none",
     l2_strength: float = 1e-2,
     seed: int = 0,
-    grad_threshold: float = 1e-4,
+    grad_threshold: float = 1e-5,
     max_iter: int = 100,
 ) -> SparseProbeResult:
     """Fit a leakage-safe k-sparse probe.
@@ -532,8 +529,8 @@ def fit_sparse_probe(
         raise TypeError(f"seed must be int, got {type(seed)}")
     if not isinstance(grad_threshold, (float, int)) or isinstance(grad_threshold, bool):
         raise TypeError(f"grad_threshold must be float, got {type(grad_threshold)}")
-    if float(grad_threshold) <= 0:
-        raise ValueError(f"grad_threshold must be positive, got {grad_threshold}")
+    if not math.isfinite(float(grad_threshold)) or not 0 < float(grad_threshold) <= 1:
+        raise ValueError(f"grad_threshold must lie in (0, 1], got {grad_threshold}")
     if not isinstance(max_iter, int) or isinstance(max_iter, bool) or max_iter <= 0:
         raise ValueError(f"max_iter must be positive int, got {max_iter}")
 
@@ -566,8 +563,10 @@ def fit_sparse_probe(
     class_counts = {int(c): int((y_int == c).sum().item()) for c in labels}
 
     # Slice
-    X_train = X[train_indices]
-    X_test = X[test_indices]
+    train_device = train_indices.to(device=X.device)
+    test_device = test_indices.to(device=X.device)
+    X_train = X.index_select(0, train_device)
+    X_test = X.index_select(0, test_device)
     y_train_int = y_int[train_indices]
     y_test_int = y_int[test_indices]
 
@@ -615,18 +614,16 @@ def fit_sparse_probe(
     w, b, objective, grad_norm, n_iter, converged = _fit_logistic_lbfgs(
         X_train_sel,
         y_train_bin,
-        X_test_sel,
         float(l2_strength),
         class_weights,
-        pos_int,
         y_train_int,
         float(grad_threshold),
         max_iter=max_iter,
     )
 
     # Evaluate held-out
-    # Need to compute logits on test set with fitted w,b (CPU float64 then back)
-    X_test_sel_cpu = X_test_sel.to(dtype=torch.float64, device=torch.device("cpu"))
+    # Evaluate with the CPU float64 parameters returned by LBFGS.
+    X_test_sel_cpu = X_test_sel.to(device="cpu").to(dtype=torch.float64)
     w_cpu = w.to(dtype=torch.float64)
     logits_test = X_test_sel_cpu @ w_cpu + b
     metrics = _compute_metrics(logits_test, y_test_bin.to(dtype=torch.float64))
@@ -639,6 +636,8 @@ def fit_sparse_probe(
         preprocess=preprocess,
         l2_strength=float(l2_strength),
         seed=int(seed),
+        max_iter=int(max_iter),
+        grad_threshold=float(grad_threshold),
         labels=labels,
         class_counts=class_counts,
         n_train=n_train,
@@ -665,8 +664,8 @@ def fit_sparse_probe(
 
 
 def sweep_sparse_probe(
-    X: torch.Tensor,
-    y: torch.Tensor,
+    X: Float[torch.Tensor, "example feature"],
+    y: Bool[torch.Tensor, "example"] | Integer[torch.Tensor, "example"],
     ks: List[int],
     test_fraction: float = 0.3,
     positive_label: int = 1,
@@ -675,7 +674,7 @@ def sweep_sparse_probe(
     n_random_subsets: int = 20,
     n_label_shuffles: int = 20,
     seed: int = 0,
-    grad_threshold: float = 1e-4,
+    grad_threshold: float = 1e-5,
     max_iter: int = 100,
 ) -> SparseSweepResult:
     """Sweep k-sparse probes over a fixed split with controls.
@@ -732,6 +731,12 @@ def sweep_sparse_probe(
         or n_label_shuffles < 0
     ):
         raise ValueError(f"n_label_shuffles must be nonnegative int, got {n_label_shuffles}")
+    if not isinstance(grad_threshold, (float, int)) or isinstance(grad_threshold, bool):
+        raise TypeError(f"grad_threshold must be float, got {type(grad_threshold)}")
+    if not math.isfinite(float(grad_threshold)) or not 0 < float(grad_threshold) <= 1:
+        raise ValueError(f"grad_threshold must lie in (0, 1], got {grad_threshold}")
+    if not isinstance(max_iter, int) or isinstance(max_iter, bool) or max_iter <= 0:
+        raise ValueError(f"max_iter must be positive int, got {max_iter}")
 
     labels, y_int = _validate_labels(y, positive_label)
     _check_class_counts(y_int)
@@ -755,8 +760,10 @@ def sweep_sparse_probe(
     train_indices, test_indices, n_train_per_class, n_test_per_class, gen = _prepare_split(
         X, y_int, float(test_fraction), seed
     )
-    X_train = X[train_indices]
-    X_test = X[test_indices]
+    train_device = train_indices.to(device=X.device)
+    test_device = test_indices.to(device=X.device)
+    X_train = X.index_select(0, train_device)
+    X_test = X.index_select(0, test_device)
     y_train_int = y_int[train_indices]
     y_test_int = y_int[test_indices]
 
@@ -796,15 +803,13 @@ def sweep_sparse_probe(
         w, b, objective, grad_norm, n_iter, converged = _fit_logistic_lbfgs(
             Xtr_sel,
             y_train_bin,
-            Xte_sel,
             float(l2_strength),
             class_weights,
-            pos_int,
             y_train_int,
             float(grad_threshold),
             max_iter=max_iter,
         )
-        Xte_cpu = Xte_sel.to(dtype=torch.float64, device=torch.device("cpu"))
+        Xte_cpu = Xte_sel.to(device="cpu").to(dtype=torch.float64)
         logits_test = Xte_cpu @ w.to(dtype=torch.float64) + b
         metrics = _compute_metrics(logits_test, y_test_bin.to(dtype=torch.float64))
         class_counts = {int(c): int((y_int == c).sum().item()) for c in labels}
@@ -815,6 +820,8 @@ def sweep_sparse_probe(
             preprocess=preprocess,
             l2_strength=float(l2_strength),
             seed=int(seed),
+            max_iter=int(max_iter),
+            grad_threshold=float(grad_threshold),
             labels=labels,
             class_counts=class_counts,
             n_train=int(train_indices.shape[0]),
@@ -862,15 +869,13 @@ def sweep_sparse_probe(
             w2, b2, obj2, gn2, ni2, cv2 = _fit_logistic_lbfgs(
                 Xr_tr,
                 y_train_bin,
-                Xr_te,
                 float(l2_strength),
                 class_weights,
-                pos_int,
                 y_train_int,
                 float(grad_threshold),
                 max_iter=max_iter,
             )
-            Xte2 = Xr_te.to(dtype=torch.float64, device=torch.device("cpu"))
+            Xte2 = Xr_te.to(device="cpu").to(dtype=torch.float64)
             logits2 = Xte2 @ w2.to(dtype=torch.float64) + b2
             metrics2 = _compute_metrics(logits2, y_test_bin.to(dtype=torch.float64))
             rand_list.append(
@@ -881,6 +886,8 @@ def sweep_sparse_probe(
                     preprocess=preprocess,
                     l2_strength=float(l2_strength),
                     seed=int(seed),
+                    max_iter=int(max_iter),
+                    grad_threshold=float(grad_threshold),
                     labels=labels,
                     class_counts=class_counts,
                     n_train=int(train_indices.shape[0]),
@@ -937,15 +944,13 @@ def sweep_sparse_probe(
             w3, b3, obj3, gn3, ni3, cv3 = _fit_logistic_lbfgs(
                 Xs_tr,
                 y_shuf_bin,
-                Xs_te,
                 float(l2_strength),
                 cw_shuf,
-                pos_int,
                 y_shuf,
                 float(grad_threshold),
                 max_iter=max_iter,
             )
-            Xte3 = Xs_te.to(dtype=torch.float64, device=torch.device("cpu"))
+            Xte3 = Xs_te.to(device="cpu").to(dtype=torch.float64)
             logits3 = Xte3 @ w3.to(dtype=torch.float64) + b3
             # Evaluate against *untouched* test labels
             metrics3 = _compute_metrics(logits3, y_test_bin.to(dtype=torch.float64))
@@ -957,6 +962,8 @@ def sweep_sparse_probe(
                     preprocess=preprocess,
                     l2_strength=float(l2_strength),
                     seed=int(seed),
+                    max_iter=int(max_iter),
+                    grad_threshold=float(grad_threshold),
                     labels=labels,
                     class_counts=class_counts,
                     n_train=int(train_indices.shape[0]),
@@ -989,6 +996,8 @@ def sweep_sparse_probe(
         preprocess=preprocess,
         l2_strength=float(l2_strength),
         seed=int(seed),
+        max_iter=int(max_iter),
+        grad_threshold=float(grad_threshold),
         probes=probes,
         random_controls=random_controls,
         label_shuffle_controls=label_shuffle_controls,
